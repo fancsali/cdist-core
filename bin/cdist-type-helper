@@ -1,0 +1,217 @@
+#!/bin/sh
+set -e -u
+
+
+# Helper functions
+
+quote() { printf '%s\n' "$*" | sed "s/'/'\\\\''/g;1s/^/'/;\$s/\$/'/"; }
+
+breify() {
+	# Convert arguments to a POSIX BRE-compatible form, i.e. escape special
+	# characters (incl. delimiter)
+	printf '%s\n' "$*" | sed -e 's/[].^$*\[]/\\&/g' -e 's:/:\\/:g'
+}
+
+require() {
+	for _bin
+	do
+		shift
+		command -v "${_bin}" >/dev/null 2>&1 || {
+			set -- "$@" "${_bin}"
+		}
+	done
+	if test -n "$*"
+	then
+		printf 'error: missing: %s\n' "$@" >&2
+		return 1
+	fi
+	unset _bin
+}
+
+
+# Help
+
+help() {
+	usage
+	echo
+	cat <<-EOF
+	cdist-type-helper allows you to easily move cdist types between Git repos and
+	make sets of arbitrary type combinations.
+	
+	Commands:
+	
+	copy ...
+	    ...
+	move ...
+	    ...
+	make-set ...
+	    ...
+	EOF
+}
+
+usage() {
+	printf 'usage: %s [-h] [-r conf_dir] <command> [<args>]\n' "$0"
+}
+
+
+# commands
+
+cmd_copy() {
+	: "${conf_path:?}"  # require $conf_path
+	require git
+
+	OPTIND=0
+	while getopts ':b:p:r:' _opt
+	do
+		case ${_opt}
+		in
+			(b)
+				branch=${OPTARG}
+				;;
+			(p)
+				dest_prefix=${OPTARG}
+				;;
+			(r)
+				dest_repo=${OPTARG}
+				;;
+			(\?)
+				shift $((OPTIND-2))
+				printf 'error: illegal option for %s: %s\n' "$0 ${command}" "$1" >&2
+				exit 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+	unset _opt
+
+	type_name=${1:?missing type name}
+
+	test -n "${dest_repo-}" || {
+		printf 'error: option -r is required for %s command.\n' "${command}" >&2
+		exit 1
+	}
+
+	src_path="${conf_prefix%/}${conf_prefix:+/}type/${type_name}"
+	dst_path="${dest_prefix-}${dest_prefix:+/}type"
+	file_filter="^$(breify "${src_path}")\(\$\|/\)"
+
+	printf 'Creating new (temporary) branch in source: %s\n' "${branch}"
+	oldref=$(git -C "${conf_dir}" rev-parse --abbrev-ref HEAD)
+	git -C "${conf_dir}" checkout -b "${branch}" HEAD
+
+	printf 'Isolating type: %s\n' "${type_name}"
+	filter_cmd="git ls-files | grep -v $(quote "${file_filter}") | git rm -q --cached --pathspec-from-file=-"
+
+	if test "${src_path#${dst_path}}" = "${src_path}"
+	then
+		# move if necessary
+		filter_cmd="${filter_cmd-}${filter_cmd:+;}\
+		git mv $(quote "${src_path}") $(quote "${dst_path%/}/")"
+	fi
+	
+	FILTER_BRANCH_SQUELCH_WARNING=1 \
+	git -C "${conf_dir}" filter-branch --index-filter "${filter_cmd}"
+	git -C "${conf_dir}" update-ref -d "refs/original/refs/heads/${branch}"
+	
+	printf 'Pushing to: %s\n' "${dest_repo}"
+	git -C "${conf_dir}" push "${dest_repo}" "${branch}"
+	
+	# Remove temporary branch
+	printf 'Deleting temporary branch (in source): %s\n' "${branch}"
+	git -C "${conf_dir}" checkout "${oldref}"
+	git -C "${conf_dir}" branch -D "${branch}"
+}
+
+cmd_move() {
+	cmd_copy "$@"
+	
+	branch=
+	OPTIND=0
+	while getopts ':b:' _opt
+	do
+		case ${_opt}
+		in
+			(b)
+				branch=${OPTARG}
+				;;
+			(\?)
+				# ignore other options (assume they're acceptable in copy)
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+	unset _opt
+	
+	type_name=${1:?missing type name}
+	
+	src_path="${conf_prefix%/}${conf_prefix:+/}type/${type_name}"
+	
+	# delete in source repo
+	printf 'Creating branch (in source): %s\n' "${branch}"
+	git -C "${conf_dir}" checkout -b "${branch}"
+	git -C "${conf_dir}" rm --cached -r "${src_path}/"
+	git -C "${conf_dir}" commit -m "[${src_path}] Remove type"
+}
+
+cmd_make_set() {
+	: "${conf_path:?}"  # require $conf_path
+	require git
+	
+	echo 'not implemented'
+	exit 0
+}
+
+
+# main
+
+conf_dir=$(pwd -P)
+conf_prefix=
+
+while getopts 'hp:r:' _opt
+do
+	case ${_opt}
+	in
+		(h)
+			help
+			exit 0
+			;;
+		(p)
+			conf_prefix=${OPTARG}
+			;;
+		(r)
+			conf_dir=${OPTARG}
+			;;
+		(\?)  # others
+			usage
+			exit 2
+			;;
+	esac
+done
+shift $((OPTIND-1))
+unset OPTIND OPTARG _opt
+
+conf_path="${conf_dir:?}/${conf_prefix-}${conf_prefix:+/}"
+test -d "${conf_path}/type/" || {
+	printf 'error: %s does not contain a cdist conf tree.\n' "${conf_path}" >&2
+	printf 'Please set -p and -r.\n' >&2
+	exit 1
+}
+
+if test $# -ge 1
+then
+	command=$1
+	shift
+	cmd_func=cmd_$(printf '%s\n' "${command}" | tr '-' '_')
+
+	if type "${cmd_func}" >/dev/null 2>&1
+	then
+		"${cmd_func}" "$@"
+	else
+		printf 'error: invalid command: %s\n' "${command}" >&2
+		help
+		exit 1
+	fi
+else
+	printf 'No command set.\n' >&2
+	usage
+fi
